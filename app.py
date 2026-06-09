@@ -111,16 +111,10 @@ def get_driver():
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-
-    # Sur Railway : utiliser Chrome système installé via Nix
-    if os.path.exists("/usr/bin/chromium"):
-        opts.binary_location = "/usr/bin/chromium"
-        return webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=opts)
-    elif os.path.exists("/root/.nix-profile/bin/chromium"):
+    if os.path.exists("/root/.nix-profile/bin/chromium"):
         opts.binary_location = "/root/.nix-profile/bin/chromium"
         return webdriver.Chrome(service=Service("/root/.nix-profile/bin/chromedriver"), options=opts)
     else:
-        # Local : webdriver-manager
         from webdriver_manager.chrome import ChromeDriverManager
         return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
@@ -173,17 +167,21 @@ def run_extraction(filters):
             num = r[0] if r else ""
             if num in seen: continue
             seen.add(num)
+            statut = r[5] if len(r) > 5 else ""
+            # Lien PDF uniquement pour les certifiées
+            pdf_url = f"https://api.cerqual-pro.net/v1/qualitel_site_service/certificats/{num}" if statut == "Certifi\u00e9e" and num else ""
             records.append({
-                "reference":     r[0] if len(r) > 0 else "",
+                "reference":     num,
                 "nom":           r[1] if len(r) > 1 else "",
                 "cp":            r[2] if len(r) > 2 else "",
                 "ville":         r[3] if len(r) > 3 else "",
                 "departement":   r[4] if len(r) > 4 else "",
-                "statut":        r[5] if len(r) > 5 else "",
+                "statut":        statut,
                 "promoteur":     r[6] if (len(r) > 6 and r[6] not in ("", "-")) else (r[7] if len(r) > 7 else ""),
                 "groupe":        r[7] if len(r) > 7 else "",
                 "url_promoteur": r[8] if len(r) > 8 else "",
                 "date":          r[9] if len(r) > 9 else "",
+                "pdf":           pdf_url,
             })
 
         state.update({"status": "done", "message": f"\u2705 {len(records)} op\u00e9rations extraites", "progress": 100, "data": records})
@@ -224,8 +222,9 @@ def status():
 def download():
     if not state["data"]: return "Aucune donn\u00e9e", 400
     df = pd.DataFrame(state["data"])
-    df.columns = ["R\u00e9f\u00e9rence", "Nom op\u00e9ration", "Code postal", "Ville", "D\u00e9partement",
-                  "Statut", "Promoteur", "Groupe promoteur", "Site web promoteur", "Date enregistrement"]
+    df = df[["reference","nom","cp","ville","departement","statut","promoteur","groupe","url_promoteur","date","pdf"]]
+    df.columns = ["R\u00e9f\u00e9rence","Nom op\u00e9ration","Code postal","Ville","D\u00e9partement",
+                  "Statut","Promoteur","Groupe promoteur","Site web promoteur","Date enregistrement","Certificat PDF"]
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Op\u00e9rations")
@@ -275,6 +274,8 @@ tbody tr:nth-child(even){background:#F1F8E9}tbody tr:hover{background:#DCEDC8}
 tbody td{padding:7px 11px;border-bottom:1px solid #e0e0e0;vertical-align:middle}
 .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75rem;font-weight:600}
 .b-c{background:#C8E6C9;color:#1B5E20}.b-e{background:#FFF9C4;color:#E65100}
+a.pdf-link{color:#1565C0;font-size:.8rem;text-decoration:none;white-space:nowrap}
+a.pdf-link:hover{text-decoration:underline}
 tfoot td{padding:10px 11px;color:#888;font-size:.8rem;font-style:italic}
 </style></head><body>
 <header>
@@ -334,10 +335,10 @@ tfoot td{padding:10px 11px;color:#888;font-size:.8rem;font-style:italic}
     <div class="table-wrap"><table>
       <thead><tr>
         <th>R\u00e9f\u00e9rence</th><th>Nom op\u00e9ration</th><th>Promoteur</th>
-        <th>Statut</th><th>CP</th><th>Ville</th><th>D\u00e9partement</th><th>Date enreg.</th>
+        <th>Statut</th><th>CP</th><th>Ville</th><th>D\u00e9partement</th><th>Date enreg.</th><th>Certificat</th>
       </tr></thead>
       <tbody id="tbody"></tbody>
-      <tfoot><tr><td colspan="8" id="tfoot-msg"></td></tr></tfoot>
+      <tfoot><tr><td colspan="9" id="tfoot-msg"></td></tr></tfoot>
     </table></div>
   </div>
 </div>
@@ -375,9 +376,11 @@ function afficher(){
   document.getElementById("subtitle").textContent="\u2014 "+totalCount+" op\u00e9rations";
   document.getElementById("tbody").innerHTML=data.map(r=>`<tr>
     <td><code style="font-size:.78rem">${r.reference}</code></td>
-    <td><strong>${r.nom||"\u2014"}</strong></td><td>${r.promoteur||"\u2014"}</td>
+    <td><strong>${r.nom||"\u2014"}</strong></td>
+    <td>${r.promoteur||"\u2014"}</td>
     <td>${r.statut==="Certifi\u00e9e"?'<span class="badge b-c">\u2705 Certifi\u00e9e</span>':'<span class="badge b-e">\u23f3 En cours</span>'}</td>
     <td>${r.cp}</td><td>${r.ville}</td><td>${r.departement}</td><td>${r.date||"\u2014"}</td>
+    <td>${r.pdf?`<a class="pdf-link" href="${r.pdf}" target="_blank">Voir le certificat</a>`:"\u2014"}</td>
   </tr>`).join("");
   document.getElementById("tfoot-msg").textContent=totalCount>20?"Affichage des 20 premi\u00e8res lignes sur "+totalCount+" \u2014 t\u00e9l\u00e9chargez l\u2019Excel pour tout voir.":"";
   document.getElementById("results-card").style.display="block";
