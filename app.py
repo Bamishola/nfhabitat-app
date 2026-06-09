@@ -1,15 +1,16 @@
 """
-Extracteur NF Habitat — Interface web
-Fonctionne en local ET sur Railway/Render
+Extracteur NF Habitat — Interface web locale
+Lance : python app.py  puis ouvre http://localhost:5000
 """
 
-import time, json, threading, os
+import time, json, threading
 from datetime import datetime
 from flask import Flask, render_template_string, jsonify, request, send_file
 import pandas as pd
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 import io
 
 app = Flask(__name__)
@@ -48,6 +49,8 @@ def build_js(filters):
         "D\u00e9partement", "Statut de certification", "Promoteur Cabinet",
         "Promoteur Groupe", "URL Promoteur", "Date enregistrement"
     ]
+
+    # Construire le set expression en Python, passer en JSON pour éviter tout pb d'encodage
     parts = []
     if filters.get("marque"):
         parts.append("[Marque]={'" + filters["marque"] + "'}")
@@ -55,6 +58,7 @@ def build_js(filters):
         parts.append("[Type de logement]={'" + filters["type"] + "'}")
     if filters.get("region"):
         parts.append("[R\u00e9gion]={'" + filters["region"] + "'}")
+
     statut = filters.get("statut", "both")
     if statut == "both":
         parts.append('[Statut de certification]={"Certifi\u00e9e","En cours d\u2019\u00e9valuation"}')
@@ -62,9 +66,12 @@ def build_js(filters):
         parts.append('[Statut de certification]={"Certifi\u00e9e"}')
     elif statut == "encours":
         parts.append('[Statut de certification]={"En cours d\u2019\u00e9valuation"}')
+
     set_expr = "<" + ", ".join(parts) + ">" if parts else "<>"
+
     fields_json = json.dumps(fields, ensure_ascii=False)
     set_json    = json.dumps(set_expr, ensure_ascii=False)
+
     return """
 const cb = arguments[arguments.length - 1];
 (async () => {
@@ -104,75 +111,73 @@ const top = arguments[0], h = arguments[1], cb = arguments[arguments.length-1];
 })();
 """
 
-def get_driver():
+def run_extraction(filters):
+    state.update({"status": "running", "message": "Ouverture du navigateur...", "progress": 5, "data": [], "total": 0})
+
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--window-size=1400,900")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-extensions")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
 
-    # Railway : Chrome installé via Nix, pas besoin de webdriver-manager
-    if os.environ.get("RAILWAY_ENVIRONMENT") or os.path.exists("/usr/bin/chromium"):
-        chrome_bin = "/usr/bin/chromium"
-        driver_bin = "/usr/bin/chromedriver"
-        opts.binary_location = chrome_bin
-        return webdriver.Chrome(service=Service(driver_bin), options=opts)
-    else:
-        # Local : webdriver-manager
-        from webdriver_manager.chrome import ChromeDriverManager
-        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-
-def run_extraction(filters):
-    state.update({"status": "running", "message": "Ouverture du navigateur...", "progress": 5, "data": [], "total": 0})
     driver = None
     try:
-        driver = get_driver()
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
         driver.set_script_timeout(90)
 
         state.update({"message": "Connexion au site NF Habitat...", "progress": 15})
         driver.get(URL)
         time.sleep(6)
+
         try:
             driver.execute_script("document.querySelectorAll('[class*=axeptio],[id*=axeptio]').forEach(e=>e.remove());")
-        except: pass
+        except:
+            pass
 
-        state.update({"message": "Connexion \u00e0 la base Cerqual...", "progress": 25})
+        state.update({"message": "Connexion à la base Cerqual...", "progress": 25})
         driver.execute_script(SETUP_JS)
 
         for i in range(40):
             ready = driver.execute_script("return window.__qlikReady;")
             err   = driver.execute_script("return window.__qlikError;")
-            if ready: break
+            if ready:
+                break
             if err:
-                state.update({"status": "error", "message": f"Erreur Qlik : {err}"}); return
+                state.update({"status": "error", "message": f"Erreur Qlik : {err}"})
+                return
             time.sleep(1)
 
-        state.update({"message": "R\u00e9cup\u00e9ration des donn\u00e9es...", "progress": 40})
-        res = driver.execute_async_script(build_js(filters))
+        state.update({"message": "Récupération des données...", "progress": 40})
+        js = build_js(filters)
+        res = driver.execute_async_script(js)
+
         if isinstance(res, dict) and "error" in res:
-            state.update({"status": "error", "message": res["error"]}); return
+            state.update({"status": "error", "message": res["error"]})
+            return
 
         total = res["totalRows"]
-        state.update({"message": f"{total} op\u00e9rations trouv\u00e9es \u2014 chargement...", "progress": 50, "total": total})
+        state.update({"message": f"{total} opérations trouvées — chargement...", "progress": 50, "total": total})
 
         matrix = res["firstPage"]
         fetched = len(matrix)
+
         while fetched < total:
             page = driver.execute_async_script(PAGE_JS, fetched, min(900, total - fetched))
-            if isinstance(page, dict) and "error" in page: break
+            if isinstance(page, dict) and "error" in page:
+                break
             matrix.extend(page)
             fetched = len(matrix)
             pct = 50 + int((fetched / total) * 40)
-            state.update({"message": f"{fetched}/{total} r\u00e9cup\u00e9r\u00e9es...", "progress": pct})
+            state.update({"message": f"{fetched}/{total} récupérées...", "progress": pct})
 
         seen = set()
         records = []
         for r in matrix:
             num = r[0] if r else ""
-            if num in seen: continue
+            if num in seen:
+                continue
             seen.add(num)
             records.append({
                 "reference":     r[0] if len(r) > 0 else "",
@@ -187,14 +192,17 @@ def run_extraction(filters):
                 "date":          r[9] if len(r) > 9 else "",
             })
 
-        state.update({"status": "done", "message": f"\u2705 {len(records)} op\u00e9rations extraites", "progress": 100, "data": records})
+        state.update({"status": "done", "message": f"✅ {len(records)} opérations extraites", "progress": 100, "data": records})
 
     except Exception as e:
         state.update({"status": "error", "message": str(e)})
     finally:
         if driver:
-            try: driver.quit()
-            except: pass
+            try:
+                driver.quit()
+            except:
+                pass
+
 
 @app.route("/")
 def index():
@@ -203,7 +211,7 @@ def index():
 @app.route("/api/extract", methods=["POST"])
 def extract():
     if state["status"] == "running":
-        return jsonify({"error": "Extraction d\u00e9j\u00e0 en cours"}), 400
+        return jsonify({"error": "Extraction déjà en cours"}), 400
     filters = request.json or {}
     t = threading.Thread(target=run_extraction, args=(filters,))
     t.daemon = True
@@ -223,14 +231,15 @@ def status():
 
 @app.route("/api/download")
 def download():
-    if not state["data"]: return "Aucune donn\u00e9e", 400
+    if not state["data"]:
+        return "Aucune donnée", 400
     df = pd.DataFrame(state["data"])
-    df.columns = ["R\u00e9f\u00e9rence", "Nom op\u00e9ration", "Code postal", "Ville", "D\u00e9partement",
+    df.columns = ["Référence", "Nom opération", "Code postal", "Ville", "Département",
                   "Statut", "Promoteur", "Groupe promoteur", "Site web promoteur", "Date enregistrement"]
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Op\u00e9rations")
-        ws = writer.sheets["Op\u00e9rations"]
+        df.to_excel(writer, index=False, sheet_name="Opérations")
+        ws = writer.sheets["Opérations"]
         ws.auto_filter.ref = ws.dimensions
         for col in ws.columns:
             w = max((len(str(c.value or "")) for c in col), default=10)
@@ -241,14 +250,18 @@ def download():
                      download_name=f"NF_Habitat_{stamp}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-HTML = open(__file__.replace("app.py","") + "templates/index.html", encoding="utf-8").read() if False else '''<!DOCTYPE html>
-<html lang="fr"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+
+HTML = '''<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Extracteur NF Habitat</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',Arial,sans-serif;background:#f0f4f0;color:#1a1a1a;min-height:100vh}
 header{background:#2E7D32;color:white;padding:18px 32px;display:flex;align-items:center;gap:14px;box-shadow:0 2px 8px rgba(0,0,0,.15)}
-header h1{font-size:1.3rem;font-weight:700}header p{font-size:.82rem;opacity:.8;margin-top:2px}
+header h1{font-size:1.3rem;font-weight:700}
+header p{font-size:.82rem;opacity:.8;margin-top:2px}
 .wrap{max-width:1100px;margin:0 auto;padding:24px 16px}
 .card{background:white;border-radius:10px;box-shadow:0 1px 6px rgba(0,0,0,.08);padding:24px 28px;margin-bottom:20px}
 .card h2{font-size:.9rem;font-weight:700;color:#2E7D32;text-transform:uppercase;letter-spacing:.05em;margin-bottom:16px}
@@ -258,8 +271,10 @@ select,input{width:100%;padding:9px 12px;border:1.5px solid #ddd;border-radius:6
 select:focus,input:focus{outline:none;border-color:#4CAF50;background:white}
 .actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px;align-items:center}
 .btn{padding:10px 22px;border-radius:7px;border:none;font-size:.9rem;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:7px;transition:all .15s}
-.btn-green{background:#2E7D32;color:white}.btn-green:hover{background:#1B5E20}.btn-green:disabled{background:#A5D6A7;cursor:not-allowed}
-.btn-blue{background:#1565C0;color:white}.btn-blue:hover{background:#0D47A1}.btn-blue:disabled{background:#90CAF9;cursor:not-allowed}
+.btn-green{background:#2E7D32;color:white}.btn-green:hover{background:#1B5E20}
+.btn-green:disabled{background:#A5D6A7;cursor:not-allowed}
+.btn-blue{background:#1565C0;color:white}.btn-blue:hover{background:#0D47A1}
+.btn-blue:disabled{background:#90CAF9;cursor:not-allowed}
 .btn-gray{background:#e0e0e0;color:#333}.btn-gray:hover{background:#bdbdbd}
 #status-box{padding:10px 16px;border-radius:7px;font-size:.88rem;font-weight:500;display:none;margin-top:12px}
 .s-loading{background:#FFF9C4;color:#E65100;display:block!important}
@@ -272,12 +287,15 @@ select:focus,input:focus{outline:none;border-color:#4CAF50;background:white}
 .table-wrap{overflow-x:auto;margin-top:8px}
 table{width:100%;border-collapse:collapse;font-size:.83rem}
 thead th{background:#2E7D32;color:white;padding:9px 11px;text-align:left;white-space:nowrap;position:sticky;top:0}
-tbody tr:nth-child(even){background:#F1F8E9}tbody tr:hover{background:#DCEDC8}
+tbody tr:nth-child(even){background:#F1F8E9}
+tbody tr:hover{background:#DCEDC8}
 tbody td{padding:7px 11px;border-bottom:1px solid #e0e0e0;vertical-align:middle}
 .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75rem;font-weight:600}
 .b-c{background:#C8E6C9;color:#1B5E20}.b-e{background:#FFF9C4;color:#E65100}
 tfoot td{padding:10px 11px;color:#888;font-size:.8rem;font-style:italic}
-</style></head><body>
+</style>
+</head>
+<body>
 <header>
   <svg width="34" height="34" viewBox="0 0 34 34" fill="none">
     <rect width="34" height="34" rx="7" fill="white" fill-opacity=".15"/>
@@ -287,45 +305,56 @@ tfoot td{padding:10px 11px;color:#888;font-size:.8rem;font-style:italic}
   </svg>
   <div><h1>Extracteur NF Habitat</h1><p>Donn\u00e9es live Cerqual \u2014 certifi\u00e9es et en cours d\u2019\u00e9valuation</p></div>
 </header>
+
 <div class="wrap">
   <div class="card">
     <h2>\U0001f50d Filtres</h2>
     <div class="grid">
-      <div><label>R\u00e9gion</label><select id="f-region">
-        <option value="">Toutes</option>
-        <option value="Ile-de-France" selected>\u00cele-de-France</option>
-        <option value="Auvergne-Rh\u00f4ne-Alpes">Auvergne-Rh\u00f4ne-Alpes</option>
-        <option value="Bourgogne-Franche-Comt\u00e9">Bourgogne-Franche-Comt\u00e9</option>
-        <option value="Bretagne">Bretagne</option>
-        <option value="Centre-Val de Loire">Centre-Val de Loire</option>
-        <option value="Grand Est">Grand Est</option>
-        <option value="Hauts-de-France">Hauts-de-France</option>
-        <option value="Normandie">Normandie</option>
-        <option value="Nouvelle-Aquitaine">Nouvelle-Aquitaine</option>
-        <option value="Occitanie">Occitanie</option>
-        <option value="Pays de la Loire">Pays de la Loire</option>
-        <option value="Provence-Alpes-C\u00f4te d\u2019Azur">Provence-Alpes-C\u00f4te d\u2019Azur</option>
-        <option value="Guadeloupe">Guadeloupe</option>
-        <option value="Guyane">Guyane</option>
-        <option value="Martinique">Martinique</option>
-        <option value="La R\u00e9union">La R\u00e9union</option>
-      </select></div>
-      <div><label>Type de logement</label><select id="f-type">
-        <option value="">Tous</option>
-        <option value="Collectif" selected>Collectif</option>
-        <option value="Individuel">Individuel</option>
-      </select></div>
-      <div><label>Certification</label><select id="f-marque">
-        <option value="">Toutes</option>
-        <option value="NF Habitat HQE" selected>NF Habitat HQE</option>
-        <option value="NF Habitat">NF Habitat</option>
-      </select></div>
-      <div><label>Statut</label><select id="f-statut">
-        <option value="both" selected>Certifi\u00e9e + En cours</option>
-        <option value="certifiee">Certifi\u00e9e uniquement</option>
-        <option value="encours">En cours uniquement</option>
-      </select></div>
-      <div><label>Recherche libre</label><input type="text" id="f-search" placeholder="nom, ville, promoteur..."/></div>
+      <div><label>R\u00e9gion</label>
+        <select id="f-region">
+          <option value="">Toutes</option>
+          <option value="Ile-de-France" selected>\u00cele-de-France</option>
+          <option value="Auvergne-Rh\u00f4ne-Alpes">Auvergne-Rh\u00f4ne-Alpes</option>
+          <option value="Bourgogne-Franche-Comt\u00e9">Bourgogne-Franche-Comt\u00e9</option>
+          <option value="Bretagne">Bretagne</option>
+          <option value="Centre-Val de Loire">Centre-Val de Loire</option>
+          <option value="Grand Est">Grand Est</option>
+          <option value="Hauts-de-France">Hauts-de-France</option>
+          <option value="Normandie">Normandie</option>
+          <option value="Nouvelle-Aquitaine">Nouvelle-Aquitaine</option>
+          <option value="Occitanie">Occitanie</option>
+          <option value="Pays de la Loire">Pays de la Loire</option>
+          <option value="Provence-Alpes-C\u00f4te d\u2019Azur">Provence-Alpes-C\u00f4te d\u2019Azur</option>
+          <option value="Guadeloupe">Guadeloupe</option>
+          <option value="Guyane">Guyane</option>
+          <option value="Martinique">Martinique</option>
+          <option value="La R\u00e9union">La R\u00e9union</option>
+        </select>
+      </div>
+      <div><label>Type de logement</label>
+        <select id="f-type">
+          <option value="">Tous</option>
+          <option value="Collectif" selected>Collectif</option>
+          <option value="Individuel">Individuel</option>
+        </select>
+      </div>
+      <div><label>Certification</label>
+        <select id="f-marque">
+          <option value="">Toutes</option>
+          <option value="NF Habitat HQE" selected>NF Habitat HQE</option>
+          <option value="NF Habitat">NF Habitat</option>
+        </select>
+      </div>
+      <div><label>Statut</label>
+        <select id="f-statut">
+          <option value="both" selected>Certifi\u00e9e + En cours</option>
+          <option value="certifiee">Certifi\u00e9e uniquement</option>
+          <option value="encours">En cours uniquement</option>
+        </select>
+      </div>
+      <div><label>Recherche libre</label>
+        <input type="text" id="f-search" placeholder="nom, ville, promoteur..."/>
+      </div>
     </div>
     <div class="actions">
       <button class="btn btn-green" id="btn-go" onclick="lancer()">&#9654; Lancer l\u2019extraction</button>
@@ -335,92 +364,144 @@ tfoot td{padding:10px 11px;color:#888;font-size:.8rem;font-style:italic}
     <div class="progress-wrap" id="pw"><div class="progress-bar" id="pb"></div></div>
     <div id="status-box"></div>
   </div>
+
   <div class="card" id="results-card" style="display:none">
     <h2>&#128203; R\u00e9sultats <span id="subtitle" style="font-weight:400;text-transform:none;font-size:.85rem;color:#888"></span></h2>
     <div class="stats" id="stats"></div>
-    <div class="table-wrap"><table>
-      <thead><tr>
-        <th>R\u00e9f\u00e9rence</th><th>Nom op\u00e9ration</th><th>Promoteur</th>
-        <th>Statut</th><th>CP</th><th>Ville</th><th>D\u00e9partement</th><th>Date enreg.</th>
-      </tr></thead>
-      <tbody id="tbody"></tbody>
-      <tfoot><tr><td colspan="8" id="tfoot-msg"></td></tr></tfoot>
-    </table></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>R\u00e9f\u00e9rence</th><th>Nom op\u00e9ration</th><th>Promoteur</th>
+          <th>Statut</th><th>CP</th><th>Ville</th><th>D\u00e9partement</th><th>Date enreg.</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+        <tfoot><tr><td colspan="8" id="tfoot-msg"></td></tr></tfoot>
+      </table>
+    </div>
   </div>
 </div>
+
 <script>
-let allData=[], timer=null, totalCount=0;
-function lancer(){
-  const f={region:document.getElementById("f-region").value,type:document.getElementById("f-type").value,
-    marque:document.getElementById("f-marque").value,statut:document.getElementById("f-statut").value};
-  document.getElementById("btn-go").disabled=true;
-  document.getElementById("btn-dl").disabled=true;
-  document.getElementById("results-card").style.display="none";
-  allData=[];totalCount=0;
-  fetch("/api/extract",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(f)})
-    .then(()=>{timer=setInterval(pollStatus,1000);});
+let allData = [], timer = null, totalCount = 0;
+
+function lancer() {
+  const filters = {
+    region: document.getElementById("f-region").value,
+    type:   document.getElementById("f-type").value,
+    marque: document.getElementById("f-marque").value,
+    statut: document.getElementById("f-statut").value,
+  };
+  document.getElementById("btn-go").disabled = true;
+  document.getElementById("btn-dl").disabled = true;
+  document.getElementById("results-card").style.display = "none";
+  allData = []; totalCount = 0;
+
+  fetch("/api/extract", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(filters)
+  }).then(() => { timer = setInterval(pollStatus, 1000); });
 }
-function pollStatus(){
-  fetch("/api/status").then(r=>r.json()).then(d=>{
-    setStatus(d.status==="running"?"loading":d.status==="done"?"done":"error",d.message);
+
+function pollStatus() {
+  fetch("/api/status").then(r => r.json()).then(d => {
+    setStatus(
+      d.status === "running" ? "loading" : d.status === "done" ? "done" : "error",
+      d.message
+    );
     setProgress(d.progress);
-    if(d.status==="done"||d.status==="error"){
+
+    if (d.status === "done" || d.status === "error") {
       clearInterval(timer);
-      document.getElementById("btn-go").disabled=false;
-      if(d.status==="done"){allData=d.preview;totalCount=d.count;afficher();document.getElementById("btn-dl").disabled=false;}
+      document.getElementById("btn-go").disabled = false;
+      if (d.status === "done") {
+        allData = d.preview;
+        totalCount = d.count;
+        afficher();
+        document.getElementById("btn-dl").disabled = false;
+      }
     }
   });
 }
-function afficher(){
-  const q=document.getElementById("f-search").value.toLowerCase().trim();
-  const data=q?allData.filter(r=>(r.nom+r.ville+r.promoteur+r.cp).toLowerCase().includes(q)):allData;
-  const certif=allData.filter(r=>r.statut==="Certifi\u00e9e").length;
-  const cours=allData.filter(r=>r.statut&&r.statut.includes("cours")).length;
-  document.getElementById("stats").innerHTML=
-    `<div class="stat">Total\u00a0: <strong>${totalCount}</strong></div>
-     <div class="stat">\u2705 Certifi\u00e9es\u00a0: <strong>${certif}</strong></div>
-     <div class="stat">\u23f3 En cours\u00a0: <strong>${cours}</strong></div>`;
-  document.getElementById("subtitle").textContent="\u2014 "+totalCount+" op\u00e9rations";
-  document.getElementById("tbody").innerHTML=data.map(r=>`<tr>
-    <td><code style="font-size:.78rem">${r.reference}</code></td>
-    <td><strong>${r.nom||"\u2014"}</strong></td><td>${r.promoteur||"\u2014"}</td>
-    <td>${r.statut==="Certifi\u00e9e"?'<span class="badge b-c">\u2705 Certifi\u00e9e</span>':'<span class="badge b-e">\u23f3 En cours</span>'}</td>
-    <td>${r.cp}</td><td>${r.ville}</td><td>${r.departement}</td><td>${r.date||"\u2014"}</td>
-  </tr>`).join("");
-  document.getElementById("tfoot-msg").textContent=totalCount>20?"Affichage des 20 premi\u00e8res lignes sur "+totalCount+" \u2014 t\u00e9l\u00e9chargez l\u2019Excel pour tout voir.":"";
-  document.getElementById("results-card").style.display="block";
+
+function afficher() {
+  const q = document.getElementById("f-search").value.toLowerCase().trim();
+  let data = q
+    ? allData.filter(r => (r.nom+r.ville+r.promoteur+r.cp).toLowerCase().includes(q))
+    : allData;
+
+  const certif = allData.filter(r => r.statut === "Certifi\u00e9e").length;
+  const cours  = allData.filter(r => r.statut && r.statut.includes("cours")).length;
+
+  document.getElementById("stats").innerHTML =
+    `<div class="stat">Total : <strong>${totalCount}</strong></div>
+     <div class="stat">\u2705 Certifi\u00e9es : <strong>${certif}</strong></div>
+     <div class="stat">\u23f3 En cours : <strong>${cours}</strong></div>`;
+  document.getElementById("subtitle").textContent = "— " + totalCount + " op\u00e9rations";
+
+  document.getElementById("tbody").innerHTML = data.map(r => `
+    <tr>
+      <td><code style="font-size:.78rem">${r.reference}</code></td>
+      <td><strong>${r.nom || "\u2014"}</strong></td>
+      <td>${r.promoteur || "\u2014"}</td>
+      <td>${r.statut === "Certifi\u00e9e"
+        ? '<span class="badge b-c">\u2705 Certifi\u00e9e</span>'
+        : '<span class="badge b-e">\u23f3 En cours</span>'}</td>
+      <td>${r.cp}</td>
+      <td>${r.ville}</td>
+      <td>${r.departement}</td>
+      <td>${r.date || "\u2014"}</td>
+    </tr>`).join("");
+
+  document.getElementById("tfoot-msg").textContent =
+    totalCount > 20
+      ? "Affichage des 20 premi\u00e8res lignes sur " + totalCount + " \u2014 t\u00e9l\u00e9chargez l\u2019Excel pour tout voir."
+      : "";
+  document.getElementById("results-card").style.display = "block";
 }
-document.getElementById("f-search").addEventListener("input",()=>{if(allData.length)afficher();});
-function telecharger(){window.location.href="/api/download";}
-function setStatus(type,msg){
-  const el=document.getElementById("status-box");
-  el.className=type==="loading"?"s-loading":type==="done"?"s-done":"s-error";
-  el.innerHTML=msg;el.style.display="block";
+
+document.getElementById("f-search").addEventListener("input", () => {
+  if (allData.length) afficher();
+});
+
+function telecharger() { window.location.href = "/api/download"; }
+
+function setStatus(type, msg) {
+  const el = document.getElementById("status-box");
+  el.className = type === "loading" ? "s-loading" : type === "done" ? "s-done" : "s-error";
+  el.innerHTML = msg;
+  el.style.display = "block";
 }
-function setProgress(pct){
-  document.getElementById("pw").style.display="block";
-  document.getElementById("pb").style.width=pct+"%";
-  if(pct>=100)setTimeout(()=>document.getElementById("pw").style.display="none",800);
+function setProgress(pct) {
+  document.getElementById("pw").style.display = "block";
+  document.getElementById("pb").style.width = pct + "%";
+  if (pct >= 100) setTimeout(() => document.getElementById("pw").style.display = "none", 800);
 }
-function reset(){
-  document.getElementById("f-region").value="Ile-de-France";
-  document.getElementById("f-type").value="Collectif";
-  document.getElementById("f-marque").value="NF Habitat HQE";
-  document.getElementById("f-statut").value="both";
-  document.getElementById("f-search").value="";
-  document.getElementById("results-card").style.display="none";
-  document.getElementById("status-box").style.display="none";
-  document.getElementById("btn-dl").disabled=true;
-  allData=[];totalCount=0;
+function reset() {
+  document.getElementById("f-region").value = "Ile-de-France";
+  document.getElementById("f-type").value = "Collectif";
+  document.getElementById("f-marque").value = "NF Habitat HQE";
+  document.getElementById("f-statut").value = "both";
+  document.getElementById("f-search").value = "";
+  document.getElementById("results-card").style.display = "none";
+  document.getElementById("status-box").style.display = "none";
+  document.getElementById("btn-dl").disabled = true;
+  allData = []; totalCount = 0;
 }
-</script></body></html>'''
+</script>
+</body>
+</html>'''
 
 if __name__ == "__main__":
-    import webbrowser, threading
-    print("="*50)
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    is_local = port == 5000
+    print("=" * 50)
     print("  Extracteur NF Habitat")
-    print("  http://localhost:5000")
+    print(f"  http://localhost:{port}")
     print("  Ctrl+C pour arreter")
-    print("="*50)
-    threading.Timer(1.5, lambda: webbrowser.open("http://localhost:5000")).start()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print("=" * 50)
+    if is_local:
+        import webbrowser, threading
+        threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{port}")).start()
+    app.run(host="0.0.0.0", port=port, debug=False)
