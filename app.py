@@ -267,9 +267,9 @@ select:focus,input:focus{outline:none;border-color:#4CAF50;background:white}
 .progress-bar{height:6px;background:#4CAF50;border-radius:4px;width:0%;transition:width .3s}
 .stats{display:flex;gap:20px;flex-wrap:wrap;padding:10px 0;font-size:.85rem;color:#555}
 .stat strong{color:#2E7D32;font-size:1.1rem}
-.table-wrap{overflow-x:auto;margin-top:8px}
+.table-wrap{overflow-x:auto;overflow-y:auto;max-height:500px;margin-top:8px}
 table{width:100%;border-collapse:collapse;font-size:.83rem}
-thead th{background:#2E7D32;color:white;padding:9px 11px;text-align:left;white-space:nowrap;position:sticky;top:0}
+thead th{background:#2E7D32;color:white;padding:9px 11px;text-align:left;white-space:nowrap;position:sticky;top:0;z-index:1}
 tbody tr:nth-child(even){background:#F1F8E9}tbody tr:hover{background:#DCEDC8}
 tbody td{padding:7px 11px;border-bottom:1px solid #e0e0e0;vertical-align:middle}
 .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75rem;font-weight:600}
