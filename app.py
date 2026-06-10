@@ -345,51 +345,18 @@ def nf_download():
 # ════════════════════════════════════════════════════════════════════
 #  OUTIL 2 — PRESTATERRE BEE (API interne du site)
 # ════════════════════════════════════════════════════════════════════
+# ── Prestaterre : extraction 100% client-side ──────────────────────
+# L'API https://www.prestaterre.eu/postCertifiedOperations bloque les
+# requêtes depuis les serveurs cloud (Railway) mais répond bien depuis
+# un navigateur (IP résidentielle). On fait donc appeler l'API directement
+# par le navigateur de l'utilisateur via fetch(), et on envoie les données
+# au serveur Flask uniquement pour le nettoyage et l'export Excel.
+# Zéro Chrome sur Railway.
+
 state_presta = {"status": "idle", "message": "", "progress": 0, "data": [], "total": 0}
 _lock_presta = threading.Lock()
 
-PRESTA_URL = "https://www.prestaterre.eu/operations-certifiees"
-
-# JS unique : boucle ENTIÈRE côté navigateur, un seul execute_async_script.
-# Évite les 172 allers-retours Python<>Chrome qui provoquaient le timeout DevTools.
-PRESTA_ALL_JS = """
-const cb      = arguments[arguments.length - 1];
-const filters = arguments[0];
-(async () => {
-  try {
-    if (typeof postAPI !== 'function' || typeof postCertifiedOperations === 'undefined') {
-      cb({error: "API du site indisponible"}); return;
-    }
-    const allRows = [];
-    let page = 1, lastId = "", totalPages = 1, guard = 0;
-    while (guard++ < 600) {
-      const payload = {
-        page, lastId,
-        navFlag: page > 1 ? "next" : "",
-        department:           filters.department           || [],
-        city:                 filters.city                 || "",
-        operationName:        filters.operationName        || "",
-        repositoryAndVersion: filters.repositoryAndVersion || [],
-        mentionsAndLevels:    filters.mentionsAndLevels    || []
-      };
-      let resp;
-      try { resp = await postAPI(postCertifiedOperations, payload); }
-      catch(e) { break; }
-      if (!resp || !resp.data || resp.data.length === 0) break;
-      totalPages = parseInt(resp.totalPages) || 1;
-      lastId     = resp.lastId || "";
-      for (const row of resp.data) {
-        const out = [];
-        for (const k in row) { if (k !== 'latitude' && k !== 'longitude') out.push(row[k]); }
-        allRows.push(out);
-      }
-      if (page >= totalPages) break;
-      page++;
-    }
-    cb({rows: allRows, totalPages});
-  } catch(e) { cb({error: e.toString()}); }
-})();
-"""
+PRESTA_API_URL = "https://www.prestaterre.eu/postCertifiedOperations"
 
 
 def clean_html(value):
@@ -402,94 +369,71 @@ def clean_html(value):
     return s.strip(" /").strip()
 
 
-def run_presta(filters):
-    state_presta.update({"status": "running", "message": "Ouverture du navigateur...",
-                         "progress": 5, "data": [], "total": 0})
-    driver = None
-    try:
-        driver = get_driver()
-        driver.set_script_timeout(600)
-
-        state_presta.update({"message": "Connexion au site Prestaterre...", "progress": 15})
-        driver.get(PRESTA_URL)
-        time.sleep(6)
-        try:
-            driver.execute_script(
-                "document.querySelectorAll('[class*=axeptio],[id*=axeptio]').forEach(e=>e.remove());")
-        except Exception:
-            pass
-
-        state_presta.update({"message": "Initialisation de l'API du site...", "progress": 25})
-        ready = False
-        for _ in range(40):
-            ready = driver.execute_script(
-                "return (typeof postAPI==='function' && typeof postCertifiedOperations!=='undefined');")
-            if ready:
-                break
-            time.sleep(0.5)
-        if not ready:
-            state_presta.update({"status": "error",
-                                  "message": "Impossible d'accéder à l'API du site (postAPI non chargé)."}); return
-
-        state_presta.update({"message": "Récupération de toutes les pages en cours...", "progress": 35})
-
-        payload = {
-            "department":           filters.get("department", []) or [],
-            "city":                 (filters.get("city", "") or "").strip(),
-            "operationName":        (filters.get("operationName", "") or "").strip(),
-            "repositoryAndVersion": filters.get("repositoryAndVersion", []) or [],
-            "mentionsAndLevels":    filters.get("mentionsAndLevels", []) or [],
-        }
-
-        # Un seul appel — le JS boucle en interne sur toutes les pages
-        res = driver.execute_async_script(PRESTA_ALL_JS, payload)
-
-        if isinstance(res, dict) and res.get("error"):
-            state_presta.update({"status": "error", "message": res["error"]}); return
-
-        raw_rows = res.get("rows", [])
-        state_presta.update({"message": f"Nettoyage de {len(raw_rows)} lignes...", "progress": 88})
-
-        seen, deduped = set(), []
-        for r in raw_rows:
+def process_presta_data(raw_rows):
+    """Nettoie et déduplique les lignes reçues du navigateur."""
+    seen, deduped = set(), []
+    for r in raw_rows:
+        if isinstance(r, dict):
+            # Format objet : {Département, Ville, Opérations, ...}
+            keys = list(r.keys())
+            vals = [clean_html(r.get(k, "")) for k in keys
+                    if k not in ("latitude", "longitude")]
+        else:
             vals = [clean_html(x) for x in r]
-            while len(vals) < 6:
-                vals.append("")
-            key = (vals[0], vals[1], vals[2], vals[3])
-            if key not in seen:
-                seen.add(key)
-                deduped.append({
-                    "departement":  vals[0],
-                    "ville":        vals[1],
-                    "operation":    vals[2],
-                    "referentiel":  vals[3],
-                    "mentions":     vals[4],
-                    "fin_validite": vals[5],
-                })
+        while len(vals) < 6:
+            vals.append("")
+        key = (vals[0], vals[1], vals[2], vals[3])
+        if key not in seen:
+            seen.add(key)
+            deduped.append({
+                "departement":  vals[0],
+                "ville":        vals[1],
+                "operation":    vals[2],
+                "referentiel":  vals[3],
+                "mentions":     vals[4],
+                "fin_validite": vals[5],
+            })
+    return deduped
 
-        state_presta.update({"status": "done",
-                             "message": f"{len(deduped)} opérations extraites",
-                             "progress": 100, "data": deduped, "total": len(deduped)})
-    except Exception as e:
-        state_presta.update({"status": "error", "message": str(e)})
-    finally:
-        _quit_driver(driver)
+
+@app.route("/api/presta/submit", methods=["POST"])
+def presta_submit():
+    """Reçoit les données brutes envoyées par le navigateur et les stocke."""
+    body = request.json or {}
+    raw_rows = body.get("rows", [])
+    if not raw_rows:
+        return jsonify({"error": "Aucune donnée reçue"}), 400
+    deduped = process_presta_data(raw_rows)
+    state_presta.update({
+        "status": "done",
+        "message": f"{len(deduped)} opérations extraites",
+        "progress": 100,
+        "data": deduped,
+        "total": len(deduped),
+    })
+    return jsonify({"ok": True, "count": len(deduped)})
 
 
 @app.route("/api/presta/extract", methods=["POST"])
 def presta_extract():
+    # Cette route n'est plus utilisée pour lancer Chrome —
+    # elle remet juste l'état à "idle" pour que le JS sache que
+    # le serveur est prêt à recevoir les données.
     with _lock_presta:
-        if state_presta["status"] == "running":
-            return jsonify({"error": "Extraction déjà en cours"}), 400
-        state_presta["status"] = "running"   # verrouille immédiatement DANS le lock
-    t = threading.Thread(target=run_presta, args=(request.json or {},)); t.daemon = True; t.start()
+        state_presta.update({"status": "idle", "message": "", "progress": 0, "data": [], "total": 0})
     return jsonify({"ok": True})
 
 
 @app.route("/api/presta/status")
 def presta_status():
-    return jsonify({"status": state_presta["status"], "message": state_presta["message"], "progress": state_presta["progress"],
-                    "total": state_presta["total"], "count": len(state_presta["data"]), "preview": state_presta["data"][:20]})
+    return jsonify({
+        "status":   state_presta["status"],
+        "message":  state_presta["message"],
+        "progress": state_presta["progress"],
+        "total":    state_presta["total"],
+        "count":    len(state_presta["data"]),
+        "preview":  state_presta["data"][:20],
+    })
 
 
 @app.route("/api/presta/download")
@@ -1001,10 +945,79 @@ el('nf','year').addEventListener('change',()=>{if(TOOLS.nf.allData.length)nfAffi
 
 /* ---- Prestaterre ---- */
 function prestaRun(){
-  launch('presta',{
-    operationName:el('presta','op').value.trim(), city:el('presta','ville').value.trim(),
-    repositoryAndVersion:msValues('presta-ms-ref'), mentionsAndLevels:msValues('presta-ms-ment'),
-    department:msValues('presta-ms-dept')}, prestaAfficher);
+  if(TOOLS.presta.running) return;
+  TOOLS.presta.running=true;
+  el('presta','go').disabled=true; el('presta','dl').disabled=true;
+  el('presta','results').style.display='none';
+  TOOLS.presta.allData=[]; TOOLS.presta.total=0;
+
+  const filters={
+    operationName:el('presta','op').value.trim(),
+    city:el('presta','ville').value.trim(),
+    repositoryAndVersion:msValues('presta-ms-ref'),
+    mentionsAndLevels:msValues('presta-ms-ment'),
+    department:msValues('presta-ms-dept'),
+  };
+
+  // L'extraction se fait entièrement dans le navigateur de l'utilisateur —
+  // on appelle directement l'API Prestaterre (impossible depuis Railway).
+  (async()=>{
+    const API='https://www.prestaterre.eu/postCertifiedOperations';
+    const HEADERS={'Content-Type':'application/json','Accept':'application/json',
+      'Origin':'https://www.prestaterre.eu','Referer':'https://www.prestaterre.eu/operations-certifiees'};
+    const allRows=[];
+    let page=1, lastId='', totalPages=1, guard=0;
+
+    setStatus('presta','loading','Connexion à Prestaterre...');
+    setProgress('presta',5);
+
+    try{
+      while(guard++<600){
+        const payload={
+          page, lastId, navFlag: page>1?'next':'',
+          department:filters.department||[],
+          city:filters.city||'',
+          operationName:filters.operationName||'',
+          repositoryAndVersion:filters.repositoryAndVersion||[],
+          mentionsAndLevels:filters.mentionsAndLevels||[],
+        };
+        const r=await fetch(API,{method:'POST',headers:HEADERS,body:JSON.stringify(payload)});
+        if(!r.ok){setStatus('presta','error','Erreur réseau : '+r.status);TOOLS.presta.running=false;el('presta','go').disabled=false;return;}
+        const data=await r.json();
+        if(!data.data||data.data.length===0) break;
+        totalPages=parseInt(data.totalPages)||1;
+        lastId=data.lastId||'';
+        for(const row of data.data) allRows.push(row);
+        const pct=5+Math.round((page/totalPages)*80);
+        setStatus('presta','loading',`Page ${page}/${totalPages} — ${allRows.length} opérations...`);
+        setProgress('presta',pct);
+        if(page>=totalPages) break;
+        page++;
+      }
+
+      // Envoie les données brutes au serveur Flask pour nettoyage + stockage Excel
+      setStatus('presta','loading','Traitement des données...');
+      setProgress('presta',90);
+      const resp=await fetch('/api/presta/submit',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({rows:allRows})});
+      const result=await resp.json();
+      if(result.error){setStatus('presta','error',result.error);TOOLS.presta.running=false;el('presta','go').disabled=false;return;}
+
+      // Récupère l'aperçu depuis le serveur
+      const status=await fetch('/api/presta/status').then(r=>r.json());
+      TOOLS.presta.allData=status.preview;
+      TOOLS.presta.total=status.count;
+      setProgress('presta',100);
+      setStatus('presta','done',`✅ ${status.count} opérations extraites`);
+      prestaAfficher();
+      el('presta','dl').disabled=false;
+    }catch(e){
+      setStatus('presta','error','Erreur : '+e.message);
+    }
+    TOOLS.presta.running=false;
+    el('presta','go').disabled=false;
+  })();
 }
 function prestaAfficher(){
   const all=TOOLS.presta.allData, tot=TOOLS.presta.total;
