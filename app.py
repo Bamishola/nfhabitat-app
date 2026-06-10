@@ -2,10 +2,11 @@
 Extracteur NF Habitat — Interface web
 """
 
-import time, json, threading, os
+import time, json, threading, os, re
 from datetime import datetime
-from flask import Flask, render_template_string, jsonify, request, send_file
+from flask import Flask, render_template_string, jsonify, request, send_file, Response
 import pandas as pd
+import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -24,6 +25,15 @@ state = {
 QLIK_APP = "ed735054-1aec-4957-ad1b-c531be3a90bd"
 QLIK_URI = "https://qlik-public.nf-habitat.fr"
 URL      = "https://www.nf-habitat.fr/moteur-de-recherche-des-operations-certifiees-nf-habitat/"
+CERQUAL_PDF = "https://api.cerqual-pro.net/v1/qualitel_site_service/certificats/{ref}"
+
+
+def extract_year(value):
+    """Extrait l'annee (4 chiffres) d'une date au format texte (ex: '15/03/2022' -> '2022')."""
+    if not value:
+        return ""
+    m = re.search(r"(?:19|20)\d{2}", str(value))
+    return m.group(0) if m else ""
 
 SETUP_JS = """
 window.__qlikReady = false; window.__qlikError = null;
@@ -168,8 +178,9 @@ def run_extraction(filters):
             if num in seen: continue
             seen.add(num)
             statut = r[5] if len(r) > 5 else ""
+            date_val = r[9] if len(r) > 9 else ""
             # Lien PDF uniquement pour les certifiées
-            pdf_url = f"https://api.cerqual-pro.net/v1/qualitel_site_service/certificats/{num}" if statut == "Certifi\u00e9e" and num else ""
+            pdf_url = CERQUAL_PDF.format(ref=num) if statut == "Certifi\u00e9e" and num else ""
             records.append({
                 "reference":     num,
                 "nom":           r[1] if len(r) > 1 else "",
@@ -180,7 +191,8 @@ def run_extraction(filters):
                 "promoteur":     r[6] if (len(r) > 6 and r[6] not in ("", "-")) else (r[7] if len(r) > 7 else ""),
                 "groupe":        r[7] if len(r) > 7 else "",
                 "url_promoteur": r[8] if len(r) > 8 else "",
-                "date":          r[9] if len(r) > 9 else "",
+                "date":          date_val,
+                "year":          extract_year(date_val),
                 "pdf":           pdf_url,
             })
 
@@ -218,25 +230,132 @@ def status():
         "preview":  state["data"][:20],
     })
 
+@app.route("/api/pdf/<reference>")
+def pdf_proxy(reference):
+    # Securite : on n'accepte que des references alphanumeriques (pas d'injection de chemin)
+    if not reference or not re.fullmatch(r"[A-Za-z0-9_-]+", reference):
+        return "R\u00e9f\u00e9rence invalide", 400
+    url = CERQUAL_PDF.format(ref=reference)
+    try:
+        r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    except Exception as e:
+        return f"Erreur de connexion au certificat : {e}", 502
+    if r.status_code != 200 or not r.content:
+        return f"Certificat introuvable ({r.status_code})", 404
+    # Content-Type pdf + Content-Disposition inline => affichage direct dans l'onglet
+    return Response(
+        r.content,
+        mimetype="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{reference}.pdf"',
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
+
+
 @app.route("/api/download")
 def download():
     if not state["data"]: return "Aucune donn\u00e9e", 400
-    df = pd.DataFrame(state["data"])
-    df = df[["reference","nom","cp","ville","departement","statut","promoteur","groupe","url_promoteur","date","pdf"]]
-    df.columns = ["R\u00e9f\u00e9rence","Nom op\u00e9ration","Code postal","Ville","D\u00e9partement",
-                  "Statut","Promoteur","Groupe promoteur","Site web promoteur","Date enregistrement","Certificat PDF"]
+
+    rows = state["data"]
+
+    # --- Filtre annee : on garde les operations dont l'annee est >= annee choisie ---
+    year_filter = (request.args.get("year") or "").strip()
+    if year_filter.isdigit():
+        ymin = int(year_filter)
+        rows = [r for r in rows if (r.get("year") or "").isdigit() and int(r["year"]) >= ymin]
+
+    if not rows:
+        return "Aucune donn\u00e9e pour ce filtre", 400
+
+    # Base URL publique (pour que les liens PDF de l'Excel pointent vers le proxy en ligne)
+    host = request.host
+    scheme = "http" if ("localhost" in host or "127.0.0.1" in host) else "https"
+    base = f"{scheme}://{host}/"
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Op\u00e9rations"
+
+    headers = ["R\u00e9f\u00e9rence", "Nom op\u00e9ration", "Code postal", "Ville", "D\u00e9partement",
+               "Statut", "Promoteur", "Groupe promoteur", "Site web promoteur",
+               "Date enregistrement", "Ann\u00e9e", "Certificat PDF"]
+    ws.append(headers)
+
+    # Palette / styles
+    header_fill = PatternFill("solid", fgColor="2E7D32")
+    header_font = Font(color="FFFFFF", bold=True, size=11)
+    center      = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    center_s    = Alignment(horizontal="center", vertical="center")
+    left        = Alignment(horizontal="left", vertical="center")
+    thin        = Side(style="thin", color="D9E4D9")
+    border      = Border(left=thin, right=thin, top=thin, bottom=thin)
+    fill_alt    = PatternFill("solid", fgColor="F1F8E9")
+    fill_certif = PatternFill("solid", fgColor="C8E6C9")
+    fill_cours  = PatternFill("solid", fgColor="FFF3C4")
+    link_font   = Font(color="1565C0", underline="single")
+
+    STATUS_COL, YEAR_COL, PDF_COL = 6, 11, 12
+
+    # Ligne d'en-tete
+    for c, h in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.fill, cell.font, cell.alignment, cell.border = header_fill, header_font, center, border
+    ws.row_dimensions[1].height = 30
+
+    # Lignes de donnees
+    for i, rec in enumerate(rows, start=2):
+        values = [
+            rec.get("reference", ""), rec.get("nom", ""), rec.get("cp", ""),
+            rec.get("ville", ""), rec.get("departement", ""), rec.get("statut", ""),
+            rec.get("promoteur", ""), rec.get("groupe", ""), rec.get("url_promoteur", ""),
+            rec.get("date", ""), rec.get("year", ""), "",
+        ]
+        for c, v in enumerate(values, start=1):
+            cell = ws.cell(row=i, column=c, value=v)
+            cell.border = border
+            cell.alignment = center_s if c in (1, 3, 5, 11) else left
+            if i % 2 == 0:
+                cell.fill = fill_alt
+
+        # Statut colore
+        st = ws.cell(row=i, column=STATUS_COL)
+        if rec.get("statut") == "Certifi\u00e9e":
+            st.fill = fill_certif
+        elif rec.get("statut"):
+            st.fill = fill_cours
+        st.alignment = center_s
+
+        # Lien PDF -> proxy /api/pdf/<ref> (ouverture inline dans le navigateur)
+        pdf_cell = ws.cell(row=i, column=PDF_COL)
+        if rec.get("pdf") and rec.get("reference"):
+            pdf_cell.value = "Voir le certificat"
+            pdf_cell.hyperlink = f"{base}api/pdf/{rec['reference']}"
+            pdf_cell.font = link_font
+        else:
+            pdf_cell.value = "\u2014"
+        pdf_cell.alignment = center_s
+
+    # Largeurs de colonnes
+    widths = [16, 36, 11, 18, 16, 14, 26, 24, 30, 18, 8, 20]
+    for c, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+
+    # Filtre auto + gel de la ligne d'en-tete
+    ws.auto_filter.ref = ws.dimensions
+    ws.freeze_panes = "A2"
+
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Op\u00e9rations")
-        ws = writer.sheets["Op\u00e9rations"]
-        ws.auto_filter.ref = ws.dimensions
-        for col in ws.columns:
-            w = max((len(str(c.value or "")) for c in col), default=10)
-            ws.column_dimensions[col[0].column_letter].width = min(w + 2, 50)
+    wb.save(buf)
     buf.seek(0)
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    suffix = f"_des_{year_filter}" if year_filter.isdigit() else ""
     return send_file(buf, as_attachment=True,
-                     download_name=f"NF_Habitat_{stamp}.xlsx",
+                     download_name=f"NF_Habitat{suffix}_{stamp}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 HTML = '''<!DOCTYPE html>
@@ -319,6 +438,25 @@ tfoot td{padding:10px 11px;color:#888;font-size:.8rem;font-style:italic}
         <option value="certifiee">Certifi\u00e9e uniquement</option>
         <option value="encours">En cours uniquement</option>
       </select></div>
+      <div><label>Ann\u00e9e (\u00e0 partir de)</label><select id="f-year">
+        <option value="" selected>Toutes les ann\u00e9es</option>
+        <option value="2027">2027</option>
+        <option value="2026">2026</option>
+        <option value="2025">2025</option>
+        <option value="2024">2024</option>
+        <option value="2023">2023</option>
+        <option value="2022">2022</option>
+        <option value="2021">2021</option>
+        <option value="2020">2020</option>
+        <option value="2019">2019</option>
+        <option value="2018">2018</option>
+        <option value="2017">2017</option>
+        <option value="2016">2016</option>
+        <option value="2015">2015</option>
+        <option value="2014">2014</option>
+        <option value="2013">2013</option>
+        <option value="2012">2012</option>
+      </select></div>
       <div><label>Recherche libre</label><input type="text" id="f-search" placeholder="nom, ville, promoteur..."/></div>
     </div>
     <div class="actions">
@@ -366,27 +504,36 @@ function pollStatus(){
 }
 function afficher(){
   const q=document.getElementById("f-search").value.toLowerCase().trim();
-  const data=q?allData.filter(r=>(r.nom+r.ville+r.promoteur+r.cp).toLowerCase().includes(q)):allData;
+  const yr=document.getElementById("f-year").value;
+  let data=allData;
+  if(yr) data=data.filter(r=>r.year && parseInt(r.year,10)>=parseInt(yr,10));
+  if(q) data=data.filter(r=>(r.nom+r.ville+r.promoteur+r.cp).toLowerCase().includes(q));
   const certif=allData.filter(r=>r.statut==="Certifi\u00e9e").length;
   const cours=allData.filter(r=>r.statut&&r.statut.includes("cours")).length;
   document.getElementById("stats").innerHTML=
     `<div class="stat">Total\u00a0: <strong>${totalCount}</strong></div>
      <div class="stat">\u2705 Certifi\u00e9es\u00a0: <strong>${certif}</strong></div>
      <div class="stat">\u23f3 En cours\u00a0: <strong>${cours}</strong></div>`;
-  document.getElementById("subtitle").textContent="\u2014 "+totalCount+" op\u00e9rations";
+  document.getElementById("subtitle").textContent="\u2014 "+totalCount+" op\u00e9rations"+(yr?(" (\u2265 "+yr+")"):"");
   document.getElementById("tbody").innerHTML=data.map(r=>`<tr>
     <td><code style="font-size:.78rem">${r.reference}</code></td>
     <td><strong>${r.nom||"\u2014"}</strong></td>
     <td>${r.promoteur||"\u2014"}</td>
     <td>${r.statut==="Certifi\u00e9e"?'<span class="badge b-c">\u2705 Certifi\u00e9e</span>':'<span class="badge b-e">\u23f3 En cours</span>'}</td>
-    <td>${r.cp}</td><td>${r.ville}</td><td>${r.departement}</td><td>${r.date||"\u2014"}</td>
-    <td>${r.pdf?`<a class="pdf-link" href="${r.pdf}" target="_blank">Voir le certificat</a>`:"\u2014"}</td>
+    <td>${r.cp}</td><td>${r.ville}</td><td>${r.departement}</td><td>${r.year||"\u2014"}</td>
+    <td>${r.pdf?`<a class="pdf-link" href="/api/pdf/${r.reference}" target="_blank" rel="noopener">Voir le certificat</a>`:"\u2014"}</td>
   </tr>`).join("");
-  document.getElementById("tfoot-msg").textContent=totalCount>20?"Affichage des 20 premi\u00e8res lignes sur "+totalCount+" \u2014 t\u00e9l\u00e9chargez l\u2019Excel pour tout voir.":"";
+  document.getElementById("tfoot-msg").textContent = yr
+    ? "Filtre ann\u00e9e \u2265 "+yr+" appliqu\u00e9 \u00e0 l\u2019aper\u00e7u \u2014 l\u2019export Excel applique ce filtre sur la totalit\u00e9 des "+totalCount+" op\u00e9rations."
+    : (totalCount>20?"Affichage des 20 premi\u00e8res lignes sur "+totalCount+" \u2014 t\u00e9l\u00e9chargez l\u2019Excel pour tout voir.":"");
   document.getElementById("results-card").style.display="block";
 }
 document.getElementById("f-search").addEventListener("input",()=>{if(allData.length)afficher();});
-function telecharger(){window.location.href="/api/download";}
+document.getElementById("f-year").addEventListener("change",()=>{if(allData.length)afficher();});
+function telecharger(){
+  const y=document.getElementById("f-year").value;
+  window.location.href="/api/download"+(y?("?year="+encodeURIComponent(y)):"");
+}
 function setStatus(type,msg){
   const el=document.getElementById("status-box");
   el.className=type==="loading"?"s-loading":type==="done"?"s-done":"s-error";
@@ -402,6 +549,7 @@ function reset(){
   document.getElementById("f-type").value="Collectif";
   document.getElementById("f-marque").value="NF Habitat HQE";
   document.getElementById("f-statut").value="both";
+  document.getElementById("f-year").value="";
   document.getElementById("f-search").value="";
   document.getElementById("results-card").style.display="none";
   document.getElementById("status-box").style.display="none";
