@@ -23,20 +23,60 @@ app = Flask(__name__)
 # ════════════════════════════════════════════════════════════════════
 #  DRIVER PARTAGÉ
 # ════════════════════════════════════════════════════════════════════
+import tempfile, shutil, subprocess
+
+def _kill_zombies():
+    """Tue d'éventuels processus Chrome restés d'une extraction précédente (conteneur)."""
+    for name in ("chrome", "chromium", "chromium-browser", "chromedriver"):
+        try:
+            subprocess.run(["pkill", "-9", "-f", name], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception:
+            pass
+
+
 def get_driver():
+    _kill_zombies()
+    # Profil temporaire UNIQUE par lancement : évite le verrou SingletonLock
+    # qui faisait planter la 2e extraction en production ("not connected to DevTools").
+    profile = tempfile.mkdtemp(prefix="np-chrome-")
+
     opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--window-size=1600,900")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--lang=fr-FR")
+    for arg in [
+        "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+        "--disable-software-rasterizer", "--disable-extensions", "--disable-background-networking",
+        "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
+        "--disable-background-timer-throttling", "--disable-features=Translate,BackForwardCache",
+        "--no-first-run", "--no-default-browser-check", "--mute-audio",
+        "--blink-settings=imagesEnabled=false",  # économie mémoire (données = texte uniquement)
+        "--window-size=1600,900", "--lang=fr-FR",
+        f"--user-data-dir={profile}",
+    ]:
+        opts.add_argument(arg)
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+
     if os.path.exists("/root/.nix-profile/bin/chromium"):
         opts.binary_location = "/root/.nix-profile/bin/chromium"
-        return webdriver.Chrome(service=Service("/root/.nix-profile/bin/chromedriver"), options=opts)
-    from webdriver_manager.chrome import ChromeDriverManager
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+        driver = webdriver.Chrome(service=Service("/root/.nix-profile/bin/chromedriver"), options=opts)
+    else:
+        from webdriver_manager.chrome import ChromeDriverManager
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+
+    driver._profile_dir = profile  # pour le nettoyage en fin d'extraction
+    return driver
+
+
+def _quit_driver(driver):
+    """Ferme proprement le navigateur et supprime son profil temporaire."""
+    if not driver:
+        return
+    prof = getattr(driver, "_profile_dir", None)
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    if prof:
+        shutil.rmtree(prof, ignore_errors=True)
 
 
 def extract_year(value):
@@ -200,9 +240,7 @@ def run_nf(filters):
     except Exception as e:
         state_nf.update({"status": "error", "message": str(e)})
     finally:
-        if driver:
-            try: driver.quit()
-            except Exception: pass
+        _quit_driver(driver)
 
 
 @app.route("/api/nf/extract", methods=["POST"])
@@ -311,32 +349,47 @@ state_presta = {"status": "idle", "message": "", "progress": 0, "data": [], "tot
 
 PRESTA_URL = "https://www.prestaterre.eu/operations-certifiees"
 
-PRESTA_PAGE_JS = """
-const cb = arguments[arguments.length - 1];
-const p  = arguments[0];
+# JS unique : boucle ENTIÈRE côté navigateur, un seul execute_async_script.
+# Évite les 172 allers-retours Python<>Chrome qui provoquaient le timeout DevTools.
+PRESTA_ALL_JS = """
+const cb      = arguments[arguments.length - 1];
+const filters = arguments[0];
 (async () => {
   try {
     if (typeof postAPI !== 'function' || typeof postCertifiedOperations === 'undefined') {
       cb({error: "API du site indisponible"}); return;
     }
-    const data = {
-      page: p.page, lastId: p.lastId, navFlag: p.navFlag,
-      department: p.department, city: p.city, operationName: p.operationName,
-      repositoryAndVersion: p.repositoryAndVersion, mentionsAndLevels: p.mentionsAndLevels
-    };
-    const resp = await postAPI(postCertifiedOperations, data);
-    const rows = (resp && resp.data) ? resp.data.map(function(row){
-      const out = [];
-      for (const k in row) { if (k !== 'latitude' && k !== 'longitude') out.push(row[k]); }
-      return out;
-    }) : [];
-    cb({rows: rows,
-        currentPage: resp ? resp.currentPage : p.page,
-        totalPages:  resp ? (parseInt(resp.totalPages) || 1) : 1,
-        lastId:      resp ? (resp.lastId || "") : ""});
+    const allRows = [];
+    let page = 1, lastId = "", totalPages = 1, guard = 0;
+    while (guard++ < 600) {
+      const payload = {
+        page, lastId,
+        navFlag: page > 1 ? "next" : "",
+        department:           filters.department           || [],
+        city:                 filters.city                 || "",
+        operationName:        filters.operationName        || "",
+        repositoryAndVersion: filters.repositoryAndVersion || [],
+        mentionsAndLevels:    filters.mentionsAndLevels    || []
+      };
+      let resp;
+      try { resp = await postAPI(postCertifiedOperations, payload); }
+      catch(e) { break; }
+      if (!resp || !resp.data || resp.data.length === 0) break;
+      totalPages = parseInt(resp.totalPages) || 1;
+      lastId     = resp.lastId || "";
+      for (const row of resp.data) {
+        const out = [];
+        for (const k in row) { if (k !== 'latitude' && k !== 'longitude') out.push(row[k]); }
+        allRows.push(out);
+      }
+      if (page >= totalPages) break;
+      page++;
+    }
+    cb({rows: allRows, totalPages});
   } catch(e) { cb({error: e.toString()}); }
 })();
 """
+
 
 def clean_html(value):
     if value is None:
@@ -347,77 +400,80 @@ def clean_html(value):
     s = re.sub(r"\s*/\s*/\s*", " / ", s)
     return s.strip(" /").strip()
 
+
 def run_presta(filters):
-    state_presta.update({"status": "running", "message": "Ouverture du navigateur...", "progress": 5, "data": [], "total": 0})
+    state_presta.update({"status": "running", "message": "Ouverture du navigateur...",
+                         "progress": 5, "data": [], "total": 0})
     driver = None
     try:
         driver = get_driver()
-        driver.set_script_timeout(60)
+        # Timeout généreux : jusqu'à 10 min pour parcourir toutes les pages en JS
+        driver.set_script_timeout(600)
+
         state_presta.update({"message": "Connexion au site Prestaterre...", "progress": 15})
         driver.get(PRESTA_URL)
         time.sleep(4)
         try:
-            driver.execute_script("document.querySelectorAll('[class*=axeptio],[id*=axeptio]').forEach(e=>e.remove());")
+            driver.execute_script(
+                "document.querySelectorAll('[class*=axeptio],[id*=axeptio]').forEach(e=>e.remove());")
         except Exception:
             pass
 
         state_presta.update({"message": "Initialisation de l'API du site...", "progress": 25})
         ready = False
         for _ in range(40):
-            ready = driver.execute_script("return (typeof postAPI==='function' && typeof postCertifiedOperations!=='undefined');")
+            ready = driver.execute_script(
+                "return (typeof postAPI==='function' && typeof postCertifiedOperations!=='undefined');")
             if ready:
                 break
             time.sleep(0.5)
         if not ready:
-            state_presta.update({"status": "error", "message": "Impossible d'accéder à l'API du site (postAPI non chargé)."}); return
+            state_presta.update({"status": "error",
+                                  "message": "Impossible d'accéder à l'API du site (postAPI non chargé)."}); return
 
-        dept = filters.get("department", []) or []
-        city = (filters.get("city", "") or "").strip()
-        op   = (filters.get("operationName", "") or "").strip()
-        ref  = filters.get("repositoryAndVersion", []) or []
-        ment = filters.get("mentionsAndLevels", []) or []
+        state_presta.update({"message": "Récupération de toutes les pages en cours...", "progress": 35})
 
-        all_rows, page, last_id, total_pages, guard = [], 1, "", 1, 0
-        while guard < 600:
-            guard += 1
-            payload = {"page": page, "lastId": last_id, "navFlag": "next" if page > 1 else "",
-                       "department": dept, "city": city, "operationName": op,
-                       "repositoryAndVersion": ref, "mentionsAndLevels": ment}
-            res = driver.execute_async_script(PRESTA_PAGE_JS, payload)
-            if isinstance(res, dict) and res.get("error"):
-                if all_rows:
-                    break
-                state_presta.update({"status": "error", "message": res["error"]}); return
-            rows = res.get("rows", [])
-            total_pages = res.get("totalPages", 1) or 1
-            last_id = res.get("lastId", "") or ""
-            for r in rows:
-                vals = [clean_html(x) for x in r]
-                while len(vals) < 6:
-                    vals.append("")
-                all_rows.append({"departement": vals[0], "ville": vals[1], "operation": vals[2],
-                                 "referentiel": vals[3], "mentions": vals[4], "fin_validite": vals[5]})
-            state_presta.update({"message": f"Page {page}/{total_pages} — {len(all_rows)} opérations...",
-                                 "progress": min(30 + int((page / max(total_pages, 1)) * 65), 95),
-                                 "total": len(all_rows)})
-            if page >= total_pages or not rows:
-                break
-            page += 1
+        payload = {
+            "department":           filters.get("department", []) or [],
+            "city":                 (filters.get("city", "") or "").strip(),
+            "operationName":        (filters.get("operationName", "") or "").strip(),
+            "repositoryAndVersion": filters.get("repositoryAndVersion", []) or [],
+            "mentionsAndLevels":    filters.get("mentionsAndLevels", []) or [],
+        }
+
+        # Un seul appel — le JS boucle en interne sur toutes les pages
+        res = driver.execute_async_script(PRESTA_ALL_JS, payload)
+
+        if isinstance(res, dict) and res.get("error"):
+            state_presta.update({"status": "error", "message": res["error"]}); return
+
+        raw_rows = res.get("rows", [])
+        state_presta.update({"message": f"Nettoyage de {len(raw_rows)} lignes...", "progress": 88})
 
         seen, deduped = set(), []
-        for r in all_rows:
-            key = (r["departement"], r["ville"], r["operation"], r["referentiel"])
+        for r in raw_rows:
+            vals = [clean_html(x) for x in r]
+            while len(vals) < 6:
+                vals.append("")
+            key = (vals[0], vals[1], vals[2], vals[3])
             if key not in seen:
-                seen.add(key); deduped.append(r)
+                seen.add(key)
+                deduped.append({
+                    "departement":  vals[0],
+                    "ville":        vals[1],
+                    "operation":    vals[2],
+                    "referentiel":  vals[3],
+                    "mentions":     vals[4],
+                    "fin_validite": vals[5],
+                })
 
-        state_presta.update({"status": "done", "message": f"{len(deduped)} opérations extraites",
+        state_presta.update({"status": "done",
+                             "message": f"{len(deduped)} opérations extraites",
                              "progress": 100, "data": deduped, "total": len(deduped)})
     except Exception as e:
         state_presta.update({"status": "error", "message": str(e)})
     finally:
-        if driver:
-            try: driver.quit()
-            except Exception: pass
+        _quit_driver(driver)
 
 
 @app.route("/api/presta/extract", methods=["POST"])
@@ -986,4 +1042,4 @@ if __name__ == "__main__":
     if port == 5000:
         import webbrowser
         threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{port}")).start()
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
