@@ -410,6 +410,21 @@ def run_presta(filters):
         # Timeout généreux : jusqu'à 10 min pour parcourir toutes les pages en JS
         driver.set_script_timeout(600)
 
+        # Bloque les ressources lourdes/inutiles via CDP pour économiser la mémoire
+        # (sinon Chrome est tué par OOM sur Railway pendant la longue extraction).
+        # On garde jQuery + le JS du site (sur prestaterre.eu) qui fournit l'API.
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": [
+                "*googletagmanager.com*", "*google-analytics.com*", "*doubleclick*",
+                "*hs-scripts.com*", "*hs-analytics*", "*hsforms*", "*hscollectedforms*", "*hubspot*",
+                "*axept.io*", "*axeptio*",
+                "*tile.openstreetmap.org*", "*unpkg.com*",          # carte Leaflet + markercluster
+                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp",      # images inutiles
+            ]})
+        except Exception:
+            pass
+
         state_presta.update({"message": "Connexion au site Prestaterre...", "progress": 15})
         driver.get(PRESTA_URL)
         time.sleep(4)
@@ -639,7 +654,7 @@ body{font-family:'Inter',system-ui,sans-serif;color:var(--text);min-height:100vh
 
 /* ── Form ── */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:16px}
-.field label{display:block;font-size:.7rem;font-weight:600;color:var(--muted);
+.field > label{display:block;font-size:.7rem;font-weight:600;color:var(--muted);
   text-transform:uppercase;letter-spacing:.08em;margin-bottom:7px}
 .field input,.field select{width:100%;padding:11px 13px;background:var(--inset);color:var(--text);
   border:1px solid var(--border);border-radius:var(--radius-sm);font-family:inherit;font-size:.9rem;
@@ -667,10 +682,11 @@ body{font-family:'Inter',system-ui,sans-serif;color:var(--text);min-height:100vh
 .ms-pop{display:none;position:absolute;z-index:40;top:calc(100% + 6px);left:0;right:0;
   background:#fff;border:1px solid var(--border);border-radius:var(--radius-sm);
   box-shadow:0 16px 36px -14px rgba(10,100,70,.2);max-height:262px;overflow-y:auto;padding:6px}
-.ms-opt{display:flex;align-items:center;gap:10px;padding:8px 9px;font-size:.85rem;
-  border-radius:7px;cursor:pointer;color:var(--text)}
+.ms-opt{display:flex;align-items:flex-start;gap:11px;padding:9px 10px;font-size:.875rem;
+  line-height:1.35;border-radius:7px;cursor:pointer;color:var(--text);
+  text-transform:none;letter-spacing:normal;font-weight:400}
 .ms-opt:hover{background:var(--accent-soft)}
-.ms-opt input{appearance:none;width:17px;height:17px;border:1.5px solid var(--border);
+.ms-opt input{appearance:none;width:17px;height:17px;margin-top:1px;border:1.5px solid var(--border);
   border-radius:5px;background:#fff;cursor:pointer;flex-shrink:0;position:relative;transition:.15s}
 .ms-opt input:checked{background:var(--accent);border-color:var(--accent)}
 .ms-opt input:checked::after{content:"";position:absolute;left:5px;top:1.5px;width:4px;height:8px;
