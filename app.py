@@ -90,6 +90,7 @@ def extract_year(value):
 #  OUTIL 1 — NF HABITAT (Qlik / Cerqual)
 # ════════════════════════════════════════════════════════════════════
 state_nf = {"status": "idle", "message": "", "progress": 0, "data": [], "total": 0}
+_lock_nf = threading.Lock()
 
 QLIK_APP = "ed735054-1aec-4957-ad1b-c531be3a90bd"
 QLIK_URI = "https://qlik-public.nf-habitat.fr"
@@ -245,8 +246,10 @@ def run_nf(filters):
 
 @app.route("/api/nf/extract", methods=["POST"])
 def nf_extract():
-    if state_nf["status"] == "running":
-        return jsonify({"error": "Extraction déjà en cours"}), 400
+    with _lock_nf:
+        if state_nf["status"] == "running":
+            return jsonify({"error": "Extraction déjà en cours"}), 400
+        state_nf["status"] = "running"   # verrouille immédiatement DANS le lock
     t = threading.Thread(target=run_nf, args=(request.json or {},)); t.daemon = True; t.start()
     return jsonify({"ok": True})
 
@@ -346,6 +349,7 @@ def nf_download():
 #  OUTIL 2 — PRESTATERRE BEE (API interne du site)
 # ════════════════════════════════════════════════════════════════════
 state_presta = {"status": "idle", "message": "", "progress": 0, "data": [], "total": 0}
+_lock_presta = threading.Lock()
 
 PRESTA_URL = "https://www.prestaterre.eu/operations-certifiees"
 
@@ -493,8 +497,10 @@ def run_presta(filters):
 
 @app.route("/api/presta/extract", methods=["POST"])
 def presta_extract():
-    if state_presta["status"] == "running":
-        return jsonify({"error": "Extraction déjà en cours"}), 400
+    with _lock_presta:
+        if state_presta["status"] == "running":
+            return jsonify({"error": "Extraction déjà en cours"}), 400
+        state_presta["status"] = "running"   # verrouille immédiatement DANS le lock
     t = threading.Thread(target=run_presta, args=(request.json or {},)); t.daemon = True; t.start()
     return jsonify({"ok": True})
 
@@ -944,18 +950,23 @@ function setProgress(k,pct){
   if(pct>=100) setTimeout(()=>el(k,'pw').classList.remove('show'),900);
 }
 function launch(k,filters,afficher){
+  if(TOOLS[k].running) return;          // bloque double-clic instantané
+  TOOLS[k].running=true;
   el(k,'go').disabled=true; el(k,'dl').disabled=true;
   el(k,'results').style.display='none';
   TOOLS[k].allData=[]; TOOLS[k].total=0;
   fetch('/api/'+k+'/extract',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(filters)})
-    .then(()=>{ TOOLS[k].timer=setInterval(()=>poll(k,afficher),1200); });
+    .then(r=>r.json()).then(d=>{
+      if(d.error){ TOOLS[k].running=false; el(k,'go').disabled=false; setStatus(k,'error',d.error); return; }
+      TOOLS[k].timer=setInterval(()=>poll(k,afficher),1200);
+    }).catch(()=>{ TOOLS[k].running=false; el(k,'go').disabled=false; });
 }
 function poll(k,afficher){
   fetch('/api/'+k+'/status').then(r=>r.json()).then(d=>{
     setStatus(k, d.status==='running'?'loading':d.status==='done'?'done':'error', d.message);
     setProgress(k,d.progress);
     if(d.status==='done'||d.status==='error'){
-      clearInterval(TOOLS[k].timer); el(k,'go').disabled=false;
+      clearInterval(TOOLS[k].timer); TOOLS[k].running=false; el(k,'go').disabled=false;
       if(d.status==='done'){ TOOLS[k].allData=d.preview; TOOLS[k].total=d.count; afficher(); el(k,'dl').disabled=false; }
     }
   });
