@@ -37,19 +37,14 @@ def _kill_zombies():
 
 def get_driver():
     _kill_zombies()
-    # Profil temporaire UNIQUE par lancement : évite le verrou SingletonLock
-    # qui faisait planter la 2e extraction en production ("not connected to DevTools").
     profile = tempfile.mkdtemp(prefix="np-chrome-")
-
     opts = Options()
     for arg in [
-        "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-        "--disable-software-rasterizer", "--disable-extensions", "--disable-background-networking",
-        "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
-        "--disable-background-timer-throttling", "--disable-features=Translate,BackForwardCache",
-        "--no-first-run", "--no-default-browser-check", "--mute-audio",
-        "--blink-settings=imagesEnabled=false",  # économie mémoire (données = texte uniquement)
-        "--window-size=1600,900", "--lang=fr-FR",
+        "--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
+        "--disable-gpu", "--disable-software-rasterizer",
+        "--disable-extensions", "--disable-background-networking",
+        "--no-first-run", "--no-default-browser-check",
+        "--mute-audio", "--window-size=1600,900", "--lang=fr-FR",
         f"--user-data-dir={profile}",
     ]:
         opts.add_argument(arg)
@@ -57,12 +52,14 @@ def get_driver():
 
     if os.path.exists("/root/.nix-profile/bin/chromium"):
         opts.binary_location = "/root/.nix-profile/bin/chromium"
-        driver = webdriver.Chrome(service=Service("/root/.nix-profile/bin/chromedriver"), options=opts)
+        driver = webdriver.Chrome(
+            service=Service("/root/.nix-profile/bin/chromedriver"), options=opts)
     else:
         from webdriver_manager.chrome import ChromeDriverManager
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()), options=opts)
 
-    driver._profile_dir = profile  # pour le nettoyage en fin d'extraction
+    driver._profile_dir = profile
     return driver
 
 
@@ -411,27 +408,11 @@ def run_presta(filters):
     driver = None
     try:
         driver = get_driver()
-        # Timeout généreux : jusqu'à 10 min pour parcourir toutes les pages en JS
         driver.set_script_timeout(600)
-
-        # Bloque les ressources lourdes/inutiles via CDP pour économiser la mémoire
-        # (sinon Chrome est tué par OOM sur Railway pendant la longue extraction).
-        # On garde jQuery + le JS du site (sur prestaterre.eu) qui fournit l'API.
-        try:
-            driver.execute_cdp_cmd("Network.enable", {})
-            driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": [
-                "*googletagmanager.com*", "*google-analytics.com*", "*doubleclick*",
-                "*hs-scripts.com*", "*hs-analytics*", "*hsforms*", "*hscollectedforms*", "*hubspot*",
-                "*axept.io*", "*axeptio*",
-                "*tile.openstreetmap.org*", "*unpkg.com*",          # carte Leaflet + markercluster
-                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp",      # images inutiles
-            ]})
-        except Exception:
-            pass
 
         state_presta.update({"message": "Connexion au site Prestaterre...", "progress": 15})
         driver.get(PRESTA_URL)
-        time.sleep(4)
+        time.sleep(6)
         try:
             driver.execute_script(
                 "document.querySelectorAll('[class*=axeptio],[id*=axeptio]').forEach(e=>e.remove());")

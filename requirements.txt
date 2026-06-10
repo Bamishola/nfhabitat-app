@@ -1,7 +1,7 @@
 flask
-selenium
+selenium==4.15.2
 pandas
 openpyxl
-webdriver-manager
+webdriver-manager==4.0.1
 gunicorn
 requests
