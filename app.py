@@ -26,7 +26,9 @@ app = Flask(__name__)
 import tempfile, shutil, subprocess
 
 def _kill_zombies():
-    """Tue d'éventuels processus Chrome restés d'une extraction précédente (conteneur)."""
+    """Tue d'éventuels processus Chrome restés d'une extraction précédente (conteneur Linux)."""
+    if os.name == "nt":   # Windows : pkill n'existe pas, on skip
+        return
     for name in ("chrome", "chromium", "chromium-browser", "chromedriver"):
         try:
             subprocess.run(["pkill", "-9", "-f", name], check=False,
@@ -51,17 +53,16 @@ def get_driver():
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
 
     if os.path.exists("/root/.nix-profile/bin/chromium"):
+        # Railway (Linux/Nix)
         opts.binary_location = "/root/.nix-profile/bin/chromium"
         driver = webdriver.Chrome(
             service=Service("/root/.nix-profile/bin/chromedriver"), options=opts)
     else:
-        from webdriver_manager.chrome import ChromeDriverManager
-        driver = webdriver.Chrome(
-            service=Service(ChromeDriverManager().install()), options=opts)
+        # Windows / Mac — selenium gère automatiquement le bon driver
+        driver = webdriver.Chrome(options=opts)
 
     driver._profile_dir = profile
     return driver
-
 
 def _quit_driver(driver):
     """Ferme proprement le navigateur et supprime son profil temporaire."""
